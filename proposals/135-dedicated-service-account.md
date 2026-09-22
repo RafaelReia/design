@@ -94,10 +94,11 @@ status:
 ```
 
 The operator sets `KafkaProxy.status.conditions[Ready]` to `False` when the generated Deployment
-reports `ReplicaFailure=True`, copying the Kubernetes reason and message. For a missing
-ServiceAccount, KafkaProxy status is the primary diagnostic surface. This uses the operator's
-existing Deployment observation and requires no ServiceAccount permissions. The condition returns to
-`True` after the account is created and the rollout recovers.
+reports `ReplicaFailure=True`, copying the Kubernetes reason and message. It reports pod-creation
+failures beyond missing ServiceAccounts; existing proxy pods may still be serving.
+For a missing ServiceAccount, KafkaProxy status is the primary diagnostic surface. This uses the
+operator's existing Deployment observation and requires no ServiceAccount permissions. The condition
+returns to `True` after the account is created and the rollout recovers.
 
 To change accounts safely, create and configure the new account, update the `KafkaProxy`, wait for
 rollout completion, then remove the old account.
@@ -105,9 +106,10 @@ rollout completion, then remove the old account.
 ### Rollout behavior
 
 A ServiceAccount change updates the Deployment pod template. If the selected account is missing,
-replacement pods cannot be created. Kubernetes' default rolling update can remove healthy old pods
-before that failure settles, leaving fewer ready proxies. This proposal lets users choose the
-availability and capacity trade-off through the generated Deployment strategy.
+replacement pods cannot be created. With four or more replicas, Kubernetes' default 25%
+`maxUnavailable` can leave fewer ready proxies. In our five-replica test, the default strategy left
+4/5 old pods; `maxUnavailable: 0` and `maxSurge: 1` retained all five. This proposal lets users choose
+the availability and capacity trade-off through the generated Deployment strategy.
 
 For example:
 
@@ -129,10 +131,9 @@ If the strategy is omitted, Kubernetes Deployment defaults apply.
 Kind integration validation on Kubernetes v1.31.0 and v1.36.1 confirmed that a missing account
 produces `ReplicaFailure=True`/`FailedCreate` and an event stating that the referenced
 ServiceAccount was not found, that the operator surfaces the failure as `KafkaProxy Ready=False`, and
-that creating the account restores `Ready=True` and completes the rollout. The v1.31.0 five-replica
-experiment also showed the default 25%/25% policy retaining 4/5 old pods while
-`maxUnavailable: 0`/`maxSurge: 1` retained all 5. Focused operator tests covered configuring,
-changing, removing, and recovering accounts, plus CRD validation of valid and invalid names.
+that creating the account restores `Ready=True` and completes the rollout. Focused operator tests
+covered configuring, changing, removing, and recovering accounts, plus CRD validation of valid and
+invalid names.
 
 ## Affected/not affected projects
 
