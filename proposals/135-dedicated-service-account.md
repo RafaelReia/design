@@ -1,8 +1,8 @@
 # 135 - Dedicated ServiceAccount for KafkaProxy pods
 
-Add an optional `KafkaProxy.spec.infrastructure.proxyContainer.serviceAccountName` field so users
-can define a dedicated, user-managed Kubernetes ServiceAccount for KafkaProxy pods. The proposal
-also adds optional `KafkaProxy.spec.infrastructure.deployment.strategy` controls.
+Add an optional `KafkaProxy.spec.infrastructure.podTemplate.spec.serviceAccountName` field so users
+can define a dedicated, user-managed Kubernetes ServiceAccount for KafkaProxy pods. It also adds
+optional `KafkaProxy.spec.infrastructure.deployment.strategy` configuration.
 
 ## Current situation
 
@@ -31,7 +31,7 @@ mutate those identity resources to provide this capability.
 
 ## Proposal
 
-Add the optional ServiceAccount field to `KafkaProxy.spec`:
+Configure the ServiceAccount and Deployment settings on `KafkaProxy.spec`:
 
 ```yaml
 apiVersion: kroxylicious.io/v1alpha1
@@ -41,9 +41,18 @@ metadata:
   namespace: my-proxy
 spec:
   infrastructure:
-    proxyContainer:
-      serviceAccountName: kroxylicious-proxy
+    deployment:
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 0
+          maxSurge: 1
+    podTemplate:
+      spec:
+        serviceAccountName: kroxylicious-proxy
 ```
+
+These are example values; if `strategy` is omitted, Kubernetes Deployment defaults apply.
 
 The user creates and manages the referenced ServiceAccount separately:
 
@@ -58,7 +67,7 @@ metadata:
 ### API semantics
 
 - `serviceAccountName` is optional and is available on `KafkaProxy` under
-  `infrastructure.proxyContainer`; no other CRD is changed.
+  `infrastructure.podTemplate.spec`; no other CRD is changed.
 - The value is a ServiceAccount `metadata.name`, not a `namespace/name` reference.
 - Kubernetes resolves the name in the namespace of the `KafkaProxy` and its generated pod.
 - The value is validated as a DNS-1123 subdomain with a maximum length of 253 characters.
@@ -67,8 +76,10 @@ metadata:
   ServiceAccount.
 - The operator does not silently fall back to `default` when a configured account is unavailable.
 
-The placement follows the existing infrastructure API shape, while the user-managed lifecycle
-follows the Prometheus Operator's optional `spec.serviceAccountName` pattern.
+`infrastructure.podTemplate.spec` follows the Kubernetes pod template structure, leaving room for
+selected pod metadata and spec settings later. It does not expose an unrestricted template.
+The user-managed ServiceAccount lifecycle follows the Prometheus Operator's optional
+`spec.serviceAccountName` pattern.
 
 ### Ownership, permissions, and security boundary
 
@@ -79,8 +90,8 @@ read, or watch the account.
 ### Missing accounts and lifecycle
 
 If the configured ServiceAccount is missing, replacement pods fail admission and Kubernetes does not
-fall back to `default`. The generated Deployment reports `ReplicaFailure=True` with reason
-`FailedCreate`, and its ReplicaSet event includes the missing account name.
+fall back to `default`. When the generated Deployment reports `ReplicaFailure=True`, the operator
+sets `KafkaProxy.status.conditions[Ready]` to `False` and copies the condition's reason and message:
 
 The resulting `KafkaProxy` status includes:
 
@@ -93,12 +104,10 @@ status:
       message: 'Error creating: ... serviceaccount "missing-proxy" not found'
 ```
 
-The operator sets `KafkaProxy.status.conditions[Ready]` to `False` when the generated Deployment
-reports `ReplicaFailure=True`, copying the Kubernetes reason and message. It reports pod-creation
-failures beyond missing ServiceAccounts; existing proxy pods may still be serving.
-For a missing ServiceAccount, KafkaProxy status is the primary diagnostic surface. This uses the
-operator's existing Deployment observation and requires no ServiceAccount permissions. The condition
-returns to `True` after the account is created and the rollout recovers.
+This surfaces pod-creation failures generally, not only missing ServiceAccounts; existing proxy pods
+may still be serving. For a missing ServiceAccount, KafkaProxy status is the primary diagnostic
+surface. This uses the operator's existing Deployment observation and requires no ServiceAccount
+permissions. The condition returns to `True` after the account is created and the rollout recovers.
 
 To change accounts safely, create and configure the new account, update the `KafkaProxy`, wait for
 rollout completion, then remove the old account.
@@ -110,21 +119,6 @@ replacement pods cannot be created. With four or more replicas, Kubernetes' defa
 `maxUnavailable` can leave fewer ready proxies. In our five-replica test, the default strategy left
 4/5 old pods; `maxUnavailable: 0` and `maxSurge: 1` retained all five. This proposal lets users choose
 the availability and capacity trade-off through the generated Deployment strategy.
-
-For example:
-
-```yaml
-spec:
-  infrastructure:
-    deployment:
-      strategy:
-        type: RollingUpdate
-        rollingUpdate:
-          maxUnavailable: 0
-          maxSurge: 1
-```
-
-If the strategy is omitted, Kubernetes Deployment defaults apply.
 
 ### Validation evidence
 
@@ -153,16 +147,12 @@ invalid names.
 
 ## Compatibility
 
-The API fields are additive and optional. Existing `KafkaProxy` resources that omit them retain the
-current default ServiceAccount and Kubernetes Deployment rollout behavior. Removing the account
-field removes the explicit pod-template value on the next reconciliation and returns to Kubernetes
-default selection.
+The ServiceAccount and strategy fields are additive and optional. Omitting them preserves the current
+default ServiceAccount and Kubernetes Deployment rollout behavior. Removing `serviceAccountName`
+returns to namespace-default selection. A configured rollout strategy applies to all proxy updates.
 
-Existing user-managed ServiceAccounts are not adopted, owner-referenced, or modified. No additional
-operator ServiceAccount permissions are required for the reference itself.
-
-When configured, the rollout strategy applies to all proxy updates. Omitting it preserves Kubernetes
-defaults.
+`spec.replicas` remains unchanged. Moving it requires a separate compatibility design because the
+Kubernetes scale subresource uses that path.
 
 ## Rejected alternatives
 
