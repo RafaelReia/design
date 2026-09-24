@@ -1,8 +1,7 @@
 # 135 - Dedicated ServiceAccount for KafkaProxy pods
 
-Add an optional `KafkaProxy.spec.infrastructure.podTemplate.spec.serviceAccountName` field so users
-can define a dedicated, user-managed Kubernetes ServiceAccount for KafkaProxy pods. It also adds
-optional `KafkaProxy.spec.infrastructure.deployment.strategy` configuration.
+Add an optional `KafkaProxy.spec.infrastructure.serviceAccountName` field so users can define a
+dedicated, user-managed Kubernetes ServiceAccount for KafkaProxy pods.
 
 ## Current situation
 
@@ -19,6 +18,10 @@ This proposal does not add:
 - Cross-namespace ServiceAccount references.
 - Changes to automatic ServiceAccount token mounting for proxy pods.
 - ServiceAccount watches or an existence preflight.
+- Changes to Deployment rollout strategy (tracked by
+  [issue #4978](https://github.com/kroxylicious/kroxylicious/issues/4978)).
+- Changes to `KafkaProxy` status reporting (tracked by
+  [issue #4906](https://github.com/kroxylicious/kroxylicious/issues/4906)).
 
 ## Motivation
 
@@ -31,7 +34,7 @@ mutate those identity resources to provide this capability.
 
 ## Proposal
 
-Configure the ServiceAccount and Deployment settings on `KafkaProxy.spec`:
+Configure the ServiceAccount on `KafkaProxy.spec`:
 
 ```yaml
 apiVersion: kroxylicious.io/v1alpha1
@@ -41,18 +44,8 @@ metadata:
   namespace: my-proxy
 spec:
   infrastructure:
-    deployment:
-      strategy:
-        type: RollingUpdate
-        rollingUpdate:
-          maxUnavailable: 0
-          maxSurge: 1
-    podTemplate:
-      spec:
-        serviceAccountName: kroxylicious-proxy
+    serviceAccountName: kroxylicious-proxy
 ```
-
-These are example values; if `strategy` is omitted, Kubernetes Deployment defaults apply.
 
 The user creates and manages the referenced ServiceAccount separately:
 
@@ -67,7 +60,7 @@ metadata:
 ### API semantics
 
 - `serviceAccountName` is optional and is available on `KafkaProxy` under
-  `infrastructure.podTemplate.spec`; no other CRD is changed.
+  `infrastructure`; no other CRD is changed.
 - The value is a ServiceAccount `metadata.name`, not a `namespace/name` reference.
 - Kubernetes resolves the name in the namespace of the `KafkaProxy` and its generated pod.
 - The value is validated as a DNS-1123 subdomain with a maximum length of 253 characters.
@@ -76,10 +69,8 @@ metadata:
   ServiceAccount.
 - The operator does not silently fall back to `default` when a configured account is unavailable.
 
-`infrastructure.podTemplate.spec` follows the Kubernetes pod template structure, leaving room for
-selected pod metadata and spec settings later. It does not expose an unrestricted template.
-The user-managed ServiceAccount lifecycle follows the Prometheus Operator's optional
-`spec.serviceAccountName` pattern.
+This adds the one required field without defining a broader pod-template API. The user-managed
+ServiceAccount lifecycle follows the Prometheus Operator's optional `spec.serviceAccountName` pattern.
 
 ### Ownership, permissions, and security boundary
 
@@ -89,54 +80,27 @@ read, or watch the account.
 
 ### Missing accounts and lifecycle
 
-If the configured ServiceAccount is missing, replacement pods fail admission and Kubernetes does not
-fall back to `default`. When the generated Deployment reports `ReplicaFailure=True`, the operator
-sets `KafkaProxy.status.conditions[Ready]` to `False` and copies the condition's reason and message:
-
-The resulting `KafkaProxy` status includes:
-
-```yaml
-status:
-  conditions:
-    - type: Ready
-      status: "False"
-      reason: FailedCreate
-      message: 'Error creating: ... serviceaccount "missing-proxy" not found'
-```
-
-This surfaces pod-creation failures generally, not only missing ServiceAccounts; existing proxy pods
-may still be serving. For a missing ServiceAccount, KafkaProxy status is the primary diagnostic
-surface. This uses the operator's existing Deployment observation and requires no ServiceAccount
-permissions. The condition returns to `True` after the account is created and the rollout recovers.
+If the configured ServiceAccount is missing, proxy pods cannot be created and Kubernetes does not
+fall back to `default`. The generated Deployment reports `ReplicaFailure=True` with reason
+`FailedCreate`, and ReplicaSet events identify the missing account. Users can inspect those resources
+to diagnose the failed rollout. This proposal leaves Deployment rollout behavior unchanged.
 
 To change accounts safely, create and configure the new account, update the `KafkaProxy`, wait for
 rollout completion, then remove the old account.
-
-### Rollout behavior
-
-A ServiceAccount change updates the Deployment pod template. If the selected account is missing,
-replacement pods cannot be created. With four or more replicas, Kubernetes' default 25%
-`maxUnavailable` can leave fewer ready proxies. In our five-replica test, the default strategy left
-4/5 old pods; `maxUnavailable: 0` and `maxSurge: 1` retained all five. This proposal lets users choose
-the availability and capacity trade-off through the generated Deployment strategy.
 
 ### Validation evidence
 
 Kind integration validation on Kubernetes v1.31.0 and v1.36.1 confirmed that a missing account
 produces `ReplicaFailure=True`/`FailedCreate` and an event stating that the referenced
-ServiceAccount was not found, that the operator surfaces the failure as `KafkaProxy Ready=False`, and
-that creating the account restores `Ready=True` and completes the rollout. Focused operator tests
-covered configuring, changing, removing, and recovering accounts, plus CRD validation of valid and
-invalid names.
+ServiceAccount was not found. Creating the account allowed the rollout to complete.
 
 ## Affected/not affected projects
 
 **Affected:**
 
 - `kroxylicious-kubernetes/kroxylicious-kubernetes-api` — add the optional CRD field and validation.
-- `kroxylicious-kubernetes/kroxylicious-operator` — copy the field to generated proxy Deployments,
-  apply the optional rollout settings, set `KafkaProxy Ready=False` from Deployment
-  `ReplicaFailure`, and add tests.
+- `kroxylicious-kubernetes/kroxylicious-operator` — copy the field to generated proxy Deployments and
+  add tests.
 - `kroxylicious-docs` — document creation, configuration, security, lifecycle, ServiceAccount
   changes, and troubleshooting.
 
@@ -147,12 +111,8 @@ invalid names.
 
 ## Compatibility
 
-The ServiceAccount and strategy fields are additive and optional. Omitting them preserves the current
-default ServiceAccount and Kubernetes Deployment rollout behavior. Removing `serviceAccountName`
-returns to namespace-default selection. A configured rollout strategy applies to all proxy updates.
-
-`spec.replicas` remains unchanged. Moving it requires a separate compatibility design because the
-Kubernetes scale subresource uses that path.
+The field is additive and optional. Omitting it preserves the current default ServiceAccount and
+Deployment rollout behavior. Removing it returns to namespace-default ServiceAccount selection.
 
 ## Rejected alternatives
 
@@ -170,8 +130,7 @@ lifecycle and security semantics outside this feature.
 ### No ServiceAccount preflight or watch
 
 Not included because it would require additional RBAC and would still be subject to races before pod
-admission. The generated Deployment already exposes admission failures, which the operator uses to
-set the `KafkaProxy` Ready condition to `False`.
+admission. The generated Deployment and ReplicaSet already expose admission failures.
 
 ### A namespace in the reference
 
@@ -183,15 +142,12 @@ namespace would imply cross-namespace pod ServiceAccount semantics that Kubernet
 The implementation is complete when tests and documentation demonstrate that:
 
 - ServiceAccount settings render the expected pod template;
-- omitted rollout settings leave Kubernetes Deployment defaults in effect, while configured strategy
-  and rolling-update values render on the generated Deployment;
 - valid DNS-1123 names are accepted and empty or invalid names are rejected by the CRD;
 - changing the name replaces proxy pods through a normal Deployment rollout;
-- a missing account never falls back to `default`, appears as Deployment `ReplicaFailure`, and is
-  surfaced as `KafkaProxy Ready=False` with recovery after the account is restored;
-- a failed replacement rollout retains existing ready proxy pods and recovers after the account is
-  restored when the configured strategy sets `maxUnavailable: 0`;
+- a missing account never falls back to `default`, appears as Deployment `ReplicaFailure` and a
+  ReplicaSet event, with rollout recovery after the account is restored;
+- the generated Deployment rollout strategy and `KafkaProxy` status behavior remain unchanged;
 - the operator does not create, mutate, adopt, bind, delete, read, or watch the referenced account.
 
-This proposal addresses [issue #3758](https://github.com/kroxylicious/kroxylicious/issues/3758), follows
-the Prometheus Operator API pattern, and uses Kubernetes Deployment strategy semantics.
+This proposal addresses [issue #3758](https://github.com/kroxylicious/kroxylicious/issues/3758) and
+follows the Prometheus Operator API pattern.
